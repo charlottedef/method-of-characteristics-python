@@ -7,25 +7,31 @@ from dataclasses import dataclass
 
 
 # =============================================================================
-# Population balance model solved by the Method of Characteristics (MOCH)
+# Population balance model solved by
+# 1) the Method of Characteristics (MOCH)
+# 2) a finite-volume (FV) discretization on a fixed size grid
 # =============================================================================
 #
-# This script simulates a growth-only crystallization population balance model
-# with size-dependent crystal growth:
+# Governing equation
+# ------------------
+#     ∂f/∂t + ∂(G(L) f)/∂L = 0
 #
-#     dL/dt = k_gS * (1 + gamma * L)^p
+# with growth law
 #
-# and the corresponding number density evolution along each characteristic:
+#     G(L) = k_gS * (1 + gamma * L)^p
 #
-#     df/dt = -f * k_gS * gamma * p * (1 + gamma * L)^(p - 1)
+# The MOCH formulation tracks moving characteristic points L_i(t) together with
+# their associated number density values f_i(t).
 #
-# The state vector contains:
-#     1) the current characteristic locations L(t)
-#     2) the corresponding number density values f(t)
+# The FV formulation follows the MATLAB structure supplied by the user:
+#     1) define cell edges
+#     2) define pivots (cell centers)
+#     3) define cell widths
+#     4) integrate the cell inventories Q_i(t)
+#     5) recover the number density q_i(t) = Q_i(t) / ΔL_i
 #
-# The implementation is intentionally modular and highly commented for clarity.
-# For the special case p = 1, the analytical solution given in the literature
-# is included and used for validation of the numerical MOCH solution.
+# For p = 1, the analytical solution is used as a reference for both numerical
+# methods.
 # =============================================================================
 
 
@@ -72,6 +78,20 @@ def create_initial_grid(params: ModelParameters) -> np.ndarray:
     L0 = np.arange(start, stop + 0.5 * params.class_width, params.class_width)
     return L0
 
+def create_extended_fv_grid(params: ModelParameters, max_size: float = 450.0) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Erstellt ein erweitertes, ortsfestes Gitter für die Eulersche Finite-Volumen-Methode.
+    """
+    span = 4.0 * params.std_dev
+    start = params.mean_size - span
+    
+    # Gitter bis zur erwarteten Maximalgröße aufspannen
+    L_grid_fv = np.arange(start, max_size + 0.5 * params.class_width, params.class_width)
+    
+    # Initiale Verteilung auf das neue, große Gitter projizieren
+    f_initial_fv = create_initial_number_density(L_grid_fv, params)
+    
+    return L_grid_fv, f_initial_fv
 
 def create_initial_number_density(L0: np.ndarray, params: ModelParameters) -> np.ndarray:
     """
@@ -150,6 +170,53 @@ def growth_model_rhs(
 
     return np.concatenate([dL_dt, df_dt])
 
+def fv_model_rhs(
+    t: float,
+    N_temp: np.ndarray,
+    growth_constant: float,
+    gamma: float,
+    p: float,
+    L_centers: np.ndarray,
+    delta_L: float
+) -> np.ndarray:
+    """
+    Right-hand side of the ODE system for the Finite Volume method.
+    Structure mirrors the provided MATLAB implementation.
+    """
+    n_classes = len(L_centers)
+    N_temp = np.maximum(N_temp, 0.0)
+    
+    # Pad array for boundary conditions
+    n_temp = np.zeros(n_classes + 2)
+    n_temp[1:-1] = N_temp / delta_L
+
+    # Growth rate at cell boundaries
+    L_faces = L_centers + 0.5 * delta_L
+    G_faces = growth_constant * (1.0 + gamma * L_faces)**p
+    G1_pos = np.zeros(n_classes + 1)
+    G1_pos[1:] = G_faces
+    G1_pos[-1] = 0.0 
+
+    epsilon = 1e-10
+
+    # Flux limiter calculation (Koren/Van Leer analogy)
+    num = n_temp[2:] - n_temp[1:-1] + epsilon
+    den = n_temp[1:-1] - n_temp[:-2] + epsilon
+    r = num / den
+    PHI = (np.abs(r) + r) / (1.0 + np.abs(r))
+
+    n_at_borders_pos = np.zeros(n_classes + 1)
+    n_at_borders_pos[1:] = n_temp[1:-1] + 0.5 * PHI * den
+    
+    Y1_at_borders_pos = np.maximum(n_at_borders_pos, 0.0)
+
+    # Flux computation
+    dNdt_Growth1 = G1_pos * Y1_at_borders_pos
+    dNdt_Growth1_out = -dNdt_Growth1[1:]
+    dNdt_Growth1_in = dNdt_Growth1[:-1]
+
+    dNdt = dNdt_Growth1_out + dNdt_Growth1_in
+    return dNdt
 
 def compute_effective_class_widths(L: np.ndarray) -> np.ndarray:
     """
@@ -274,11 +341,39 @@ def simulate_moch(params: ModelParameters):
 
     return T, L_initial, f_initial, L_history, f_history, total_number_history
 
+def simulate_fv(params: ModelParameters, L_initial: np.ndarray, f_initial: np.ndarray, T: np.ndarray):
+    """
+    Run the Finite Volume simulation using the identical time grid.
+    """
+    # Transform density f to absolute numbers N for the FV solver
+    N_initial = f_initial * params.class_width
+    t_span = (T[0], T[-1])
+
+    solution = solve_ivp(
+        fun=fv_model_rhs,
+        t_span=t_span,
+        y0=N_initial,
+        t_eval=T,
+        args=(params.growth_constant, params.gamma, params.p, L_initial, params.class_width),
+        method="RK45",
+        rtol=1e-8,
+        atol=1e-10
+    )
+
+    if not solution.success:
+        raise RuntimeError(f"FV ODE solver failed: {solution.message}")
+
+    N_history = solution.y.T
+    
+    # Transform back to number density
+    f_history_fv = N_history / params.class_width
+    
+    # Neu: Berechnung der Gesamtpartikelzahl über alle Klassen für jeden Zeitschritt
+    total_number_fv = np.sum(f_history_fv * params.class_width, axis=1)
+    
+    return f_history_fv, total_number_fv
 
 def apply_publication_style():
-    """
-    plotting parameter
-    """
     plt.rcParams.update({
         "figure.dpi": 140,
         "savefig.dpi": 300,
@@ -298,78 +393,42 @@ def apply_publication_style():
 
 
 def style_axes(ax):
-    """
-    Standardize axis appearance across all figures.
-    """
     ax.grid(True)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
 
 def plot_psd_evolution(T, L_history, f_history):
-    """
-    Plot the evolution of the particle size distribution.
-
-    Each curve represents the number density distribution at a different time.
-    """
     fig, ax = plt.subplots(figsize=(8.2, 5.2))
-
     cmap = plt.get_cmap("viridis", len(T))
 
     for i, t in enumerate(T):
         label = f"{t / 60.0:.1f} min"
         ax.plot(L_history[i, :], f_history[i, :], color=cmap(i), label=label)
 
-    ax.set_title("Evolution of the particle size distribution")
+    ax.set_title("Evolution of the particle size distribution (MOCH)")
     ax.set_xlabel("Crystal size, $L$ [$\\mu$m]")
     ax.set_ylabel("Number density, $f(L,t)$")
     style_axes(ax)
-
-    # Place the legend outside the plotting area to keep the data region clean.
     ax.legend(title="Time", bbox_to_anchor=(1.02, 1.0), loc="upper left")
     fig.tight_layout()
     return fig, ax
 
 
-def plot_total_number(T, total_number_history, total_number_initial):
-    """
-    Plot the total particle number over time.
-
-    For a growth-only process, the total particle number should ideally remain
-    constant. The y-axis is therefore restricted to integer spacing, and the
-    limits are chosen from the observed minimum and maximum values with an
-    additional margin of -1 and +1 particle, respectively. This makes it clear
-    that only deviations on the scale of whole particles are visually relevant.
-    """
+def plot_total_number(T, total_number_moch, total_number_fv, total_number_initial):
     fig, ax = plt.subplots(figsize=(8.2, 4.8))
 
-    # Plot total particle number history
-    ax.plot(
-        T / 60.0,
-        total_number_history,
-        marker="o",
-        markersize=4,
-        label="Computed total number"
-    )
+    ax.plot(T / 60.0, total_number_moch, marker="o", markersize=4, label="Computed total number (MOCH)")
+    ax.plot(T / 60.0, total_number_fv, marker="s", markersize=4, label="Computed total number (Finite Volume)")
+    
+    ax.axhline(total_number_initial, linestyle="--", linewidth=1.6, label="Initial total number")
 
-    # Reference line for the initial total particle number
-    ax.axhline(
-        total_number_initial,
-        linestyle="--",
-        linewidth=1.6,
-        label="Initial total number"
-    )
+    min_particles = min(np.min(total_number_moch), np.min(total_number_fv))
+    max_particles = max(np.max(total_number_moch), np.max(total_number_fv))
 
-    # Determine observed minimum and maximum over time
-    min_particles = np.min(total_number_history)
-    max_particles = np.max(total_number_history)
-
-    # Set integer-based y-axis limits with a margin of -1 / +1
     y_lower = np.floor(min_particles) - 1
     y_upper = np.ceil(max_particles) + 1
     ax.set_ylim(y_lower, y_upper)
-
-    # Enforce integer tick spacing on the y-axis
     ax.yaxis.set_major_locator(MultipleLocator(1))
 
     ax.set_title("Total particle number over time")
@@ -384,17 +443,12 @@ def plot_total_number(T, total_number_history, total_number_initial):
 
 
 def plot_characteristics(T, L_history):
-    """
-    Plot the characteristic trajectories L_i(t).
-
-    Each line corresponds to one initial size class tracked over time.
-    """
     fig, ax = plt.subplots(figsize=(8.2, 5.2))
 
     for i in range(L_history.shape[1]):
         ax.plot(T / 60.0, L_history[:, i], alpha=0.9)
 
-    ax.set_title("Characteristic trajectories")
+    ax.set_title("Characteristic trajectories (MOCH)")
     ax.set_xlabel("Time [min]")
     ax.set_ylabel("Crystal size along characteristic, $L(t)$ [$\\mu$m]")
     style_axes(ax)
@@ -403,19 +457,10 @@ def plot_characteristics(T, L_history):
 
 
 def plot_numerical_vs_analytical(T, L_history, f_history, L_exact, f_exact):
-    """
-    Compare the numerical MOCH solution with the analytical solution for p = 1.
-
-    The comparison is shown at the final simulation time, where any discrepancy
-    is most visible.
-    """
     fig, axes = plt.subplots(1, 2, figsize=(11.0, 4.6))
-
-    # Final time index
     i_final = -1
     final_time_min = T[i_final] / 60.0
 
-    # Left panel: characteristic locations
     axes[0].plot(L_history[i_final, :], label="Numerical MOCH")
     axes[0].plot(L_exact[i_final, :], "--", label="Analytical")
     axes[0].set_title(f"Characteristic positions at {final_time_min:.1f} min")
@@ -424,7 +469,6 @@ def plot_numerical_vs_analytical(T, L_history, f_history, L_exact, f_exact):
     style_axes(axes[0])
     axes[0].legend()
 
-    # Right panel: number density values
     axes[1].plot(f_history[i_final, :], label="Numerical MOCH")
     axes[1].plot(f_exact[i_final, :], "--", label="Analytical")
     axes[1].set_title(f"Number density at {final_time_min:.1f} min")
@@ -437,26 +481,42 @@ def plot_numerical_vs_analytical(T, L_history, f_history, L_exact, f_exact):
     return fig, axes
 
 
-def main():
-    """
-    Main execution function.
-    """
-    apply_publication_style()
+def plot_method_comparison(T, L_history_moch, f_history_moch, L_grid_fv, f_history_fv, L_exact, f_exact):
+    fig, ax = plt.subplots(figsize=(9.0, 6.0))
+    i_final = -1
+    final_time_min = T[i_final] / 60.0
 
-    # -------------------------------------------------------------------------
-    # Model setup
-    # -------------------------------------------------------------------------
+    ax.plot(L_grid_fv, f_history_fv[i_final, :], '-', color='tab:blue', label='Finite Volume', linewidth=2.5)
+    ax.plot(L_history_moch[i_final, :], f_history_moch[i_final, :], 'o', color='tab:orange', markersize=5, label='MOCH', alpha=0.8)
+
+    if L_exact is not None and f_exact is not None:
+        ax.plot(L_exact[i_final, :], f_exact[i_final, :], '--', color='black', label='Analytical', linewidth=1.5)
+
+    ax.set_title(f"Comparison of Numerical Methods at $t = {final_time_min:.1f}$ min")
+    ax.set_xlabel("Crystal size, $L$ [$\\mu$m]")
+    ax.set_ylabel("Number density, $f(L,t)$")
+    
+    ax.set_xlim(np.min(L_grid_fv), np.max(L_history_moch[i_final, :]) + 10)
+    
+    style_axes(ax)
+    ax.legend()
+    fig.tight_layout()
+    return fig, ax
+
+
+def main():
+    apply_publication_style()
     params = ModelParameters()
 
-    # Run the numerical MOCH simulation.
-    T, L_initial, f_initial, L_history, f_history, total_number_history = simulate_moch(params)
-
-    # Initial total number from the discretized distribution.
+    # 1. Simulate MOCH (Lagrange)
+    T, L_initial, f_initial, L_history_moch, f_history_moch, total_number_moch = simulate_moch(params)
     total_number_initial = np.sum(f_initial * params.class_width)
 
-    # -------------------------------------------------------------------------
-    # Optional analytical validation for the special case p = 1
-    # -------------------------------------------------------------------------
+    # 2. Simulate Finite Volume (Euler) auf erweitertem Gitter
+    L_grid_fv, f_initial_fv = create_extended_fv_grid(params, max_size=450.0)
+    f_history_fv, total_number_fv = simulate_fv(params, L_grid_fv, f_initial_fv, T)
+
+    # 3. Compute Analytical Solution (for p=1)
     if np.isclose(params.p, 1.0):
         L_exact, f_exact = analytical_solution_p1(
             t=T,
@@ -465,31 +525,31 @@ def main():
             growth_constant=params.growth_constant,
             gamma=params.gamma
         )
-
-        # Compute a simple maximum absolute error at the final time.
-        max_abs_error_L = np.max(np.abs(L_history[-1, :] - L_exact[-1, :]))
-        max_abs_error_f = np.max(np.abs(f_history[-1, :] - f_exact[-1, :]))
+        
+        max_abs_error_L = np.max(np.abs(L_history_moch[-1, :] - L_exact[-1, :]))
+        max_abs_error_f = np.max(np.abs(f_history_moch[-1, :] - f_exact[-1, :]))
 
         print(f"Initial total particle number: {total_number_initial:.6f}")
-        print(f"Final total particle number:   {total_number_history[-1]:.6f}")
-        print(f"Maximum absolute error in L at final time: {max_abs_error_L:.6e}")
-        print(f"Maximum absolute error in f at final time: {max_abs_error_f:.6e}")
+        print(f"Final total particle number (MOCH): {total_number_moch[-1]:.6f}")
+        print(f"Final total particle number (FV):   {total_number_fv[-1]:.6f}")
+        print(f"Maximum absolute error in L at final time (MOCH): {max_abs_error_L:.6e}")
+        print(f"Maximum absolute error in f at final time (MOCH): {max_abs_error_f:.6e}")
     else:
         L_exact, f_exact = None, None
-
         print(f"Initial total particle number: {total_number_initial:.6f}")
-        print(f"Final total particle number:   {total_number_history[-1]:.6f}")
+        print(f"Final total particle number (MOCH): {total_number_moch[-1]:.6f}")
+        print(f"Final total particle number (FV):   {total_number_fv[-1]:.6f}")
 
-    # -------------------------------------------------------------------------
-    # Generate figures
-    # -------------------------------------------------------------------------
-    plot_psd_evolution(T, L_history, f_history)
-    plot_total_number(T, total_number_history, total_number_initial)
-    plot_characteristics(T, L_history)
-
+    # 4. Visualizations
+    plot_psd_evolution(T, L_history_moch, f_history_moch)
+    plot_total_number(T, total_number_moch, total_number_fv, total_number_initial)
+    plot_characteristics(T, L_history_moch)
+    
     if L_exact is not None and f_exact is not None:
-        plot_numerical_vs_analytical(T, L_history, f_history, L_exact, f_exact)
-
+        plot_numerical_vs_analytical(T, L_history_moch, f_history_moch, L_exact, f_exact)
+        
+    plot_method_comparison(T, L_history_moch, f_history_moch, L_grid_fv, f_history_fv, L_exact, f_exact)
+    
     plt.show()
 
 
